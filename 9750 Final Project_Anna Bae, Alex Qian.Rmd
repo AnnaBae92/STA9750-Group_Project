@@ -1,0 +1,359 @@
+---
+title: "Models on Launch Speed in MLB Baseball 2019"
+author: "Anna Bae, Alex Qian"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(modelr)
+library(lubridate)
+library(randomForest)
+library(cowplot)
+```
+
+## STA 9750 Final Project
+
+### Introduction
+
+The topic of this project is a hitter's launch speed, also referred to as exit velocity, based on various conditions in a baseball game in Major League Baseball (MLB) 2019. Our data was downloaded off of [Baseball Savant](https://baseballsavant.mlb.com/statcast_search), taking all pitches that resulted in an event.
+
+We narrowed the scope of our model to include the count (balls and strikes), runners on base, and the inning as we wanted to see how launch speed was affected by the various conditions in the game.
+
+```{r combine and clean data, warning=FALSE,include=FALSE}
+a=as_tibble(read.csv("savant_data 0424-0320.csv"))
+b=as_tibble(read.csv("savant_data 0603-0425.csv"))
+c=as_tibble(read.csv("savant_data 0715-0604.csv"))
+d=as_tibble(read.csv("savant_data 0822-0716.csv"))
+e=as_tibble(read.csv("savant_data 0929-0823.csv"))
+
+c$woba_denom=as.integer(c$woba_denom)
+
+Event_Data=a%>%
+  bind_rows(b)%>%
+  bind_rows(c)%>%
+  bind_rows(d)%>%
+  bind_rows(e)%>%
+  filter(game_date!="")
+
+MLB=Event_Data%>%
+  mutate(b3=ifelse(on_3b=="null",0,1),b2=ifelse(on_2b=="null",0,1),b1=ifelse(on_1b=="null",0,1),
+         date=mdy(game_date),
+         count=paste(balls,"-",strikes))%>%
+  mutate(bases=paste(b1,b2,b3),outs=outs_when_up)%>%
+  arrange(date,home_team,inning,desc(inning_topbot),outs)%>%
+  select(launch_speed,balls,strikes,count,bases,outs,inning)%>%
+  filter(balls!=4)
+
+factors=c("balls","strikes","bases","outs","inning","count")
+MLB[factors]=lapply(MLB[factors],factor)
+
+numerics=c("launch_speed")
+MLB[numerics]=lapply(MLB[numerics],as.numeric)
+```
+
+We note that there were rows with missing data. Particularly, there were `r dim(MLB%>%filter(is.na(launch_speed)))[1]` rows with missing launch speed. In 2019, there were `r nrow(Event_Data%>%filter(events=="walk"|events=="strikeout"))` walks and strikeouts accounting for a large proportion of these as walks and strikeouts are events without a batted ball. The remaining missing rows were from unusual events or games played in unusual locations. We choose to remove these rows from our data as they add no information to our analysis. There is also one row in which a batter had 4 balls when a pitch was thrown. We believe this is a scoring error and remove the row. 
+
+```{r filter out missing data,include=FALSE}
+MLB=MLB%>%filter(!is.na(launch_speed))
+```
+
+Thus, we are left with `r dim(MLB)[1]` rows of data. The first ten rows of the data are found below:
+
+```{r display tibble,echo=FALSE}
+MLB%>%slice(1:10)
+```
+
+We now split the data with 80% into a training set and remaining as a test set. We will use the test set for validation later.
+
+```{r split into train and test,include=FALSE}
+set.seed(9750)
+train_rows=sample(nrow(MLB),floor(nrow(MLB)*.8))
+MLB_train=MLB[train_rows,]
+MLB_test=MLB[-train_rows,]
+```
+
+### Summary Statistics
+
+Below is a histogram of all launch speeds in our training data:
+
+```{r no split histogram,echo=FALSE}
+ggplot(MLB_train)+
+  geom_histogram(aes(launch_speed),bins=50)+
+  ggtitle("Launch Speeds in MLB 2019 (training data)")+
+  labs(x="Launch Speed (Miles/Hour)",y="Count")+
+  geom_vline(aes(xintercept=mean(launch_speed)))+
+  geom_vline(aes(xintercept=median(launch_speed)))+
+  geom_text(aes(x=median(launch_speed)+2, y=2500, label="Median"), angle=90)+
+  geom_text(aes(x=mean(launch_speed)-2, y=2500, label="Mean"), angle=90)
+```
+
+Our mean launch speed is `r mean(MLB_train$launch_speed)`  with standard deviation `r sqrt(var(MLB_train$launch_speed))`. Our median launch speed is `r median(MLB_train$launch_speed)`. From our histogram, we see that our data is left skewed and multimodal with two modes near the 95 mph range and the 80 mph range. Our data also has another bump in frequency around the 40 mph range. Looking at a summary table, we find that most balls in play occur with 0 balls and 2 strikes, but the count with the most balls in play is 0-0. We also find that most balls in play occur with the bases empty and that balls are more likely to be in play in the 3rd to 5th innings.
+
+```{r summary table,echo=FALSE}
+summary(MLB_train)
+```
+
+### Exploration and Initial Models
+
+We begin exploring by looking at launch speeds as predicted by each of our independent variables: balls, strikes,bases, outs, and the inning.
+
+```{r initial models,include=FALSE}
+mod_launch_speed_none = lm(launch_speed~1, data=MLB_train)
+mod_launch_speed_balls <- lm(launch_speed~balls, data=MLB_train)
+mod_launch_speed_strikes <- lm(launch_speed~strikes, data=MLB_train)
+mod_launch_speed_bases <- lm(launch_speed~bases, data=MLB_train)
+mod_launch_speed_outs <- lm(launch_speed~outs, data=MLB_train)
+mod_launch_speed_inning=lm(launch_speed~inning,data=MLB_train)
+```
+
+We find that the AIC for the initial model of no variables, that will balls, that with strikes, that with outs, that with bases, and that with inning are `r format(AIC(mod_launch_speed_none),scientific=FALSE)`, `r format(AIC(mod_launch_speed_balls),scientific=FALSE)`,`r format(AIC(mod_launch_speed_strikes),scientific=FALSE)`, `r format(AIC(mod_launch_speed_outs),scientific=FALSE)`, `r format(AIC(mod_launch_speed_bases),scientific=FALSE)`, and `r format(AIC(mod_launch_speed_inning),scientific=FALSE)` respectively.
+
+With the lowest AIC, we show the the model with balls below:
+
+```{r summary of balls models,echo=FALSE}
+mod_launch_speed_balls
+```
+
+We will also show the model with strikes as both are related to the count of a plate appearance.
+
+```{r summary of strikes models,echo=FALSE}
+mod_launch_speed_strikes
+```
+
+We observe that as the number of balls increase in a plate appearance, the launch speed if a ball is in play also increases. Similarly, as the number of strikes increase in a plate appearance, the launch speed if a ball is in play decreases. Histogram densities are shown below with mean launch speed marked by a vertical line showing the differences in mean launch speed as the count changes in a plate appearance. We observe this increasing and decreasing effect of balls and strikes on launch speed regardless of the value of the other as shown in the third and fourth plots.
+
+```{r histogram grid,echo=FALSE}
+ggplot(MLB_train)+
+  facet_grid("balls")+
+  geom_histogram(aes(launch_speed,y=..density..),bins=50)+
+  geom_vline(data=filter(MLB_train,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,balls==3),aes(xintercept=mean(launch_speed)))+
+  ggtitle("Launch Speeds in MLB 2019 (training data) Separated by Balls")
+
+ggplot(MLB_train)+
+  facet_grid("strikes")+
+  geom_histogram(aes(launch_speed,y=..density..),bins=50)+
+  geom_vline(data=filter(MLB_train,strikes==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2),aes(xintercept=mean(launch_speed)))+
+  ggtitle("Launch Speeds in MLB 2019 (training data) Separated by Strikes")
+
+ggplot(MLB_train)+
+  facet_grid(c("balls","strikes"))+
+  geom_histogram(aes(launch_speed,y=..density..),bins=50)+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==3),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==3),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==3),aes(xintercept=mean(launch_speed)))+
+  ggtitle("Launch Speeds in MLB 2019 (training data), Balls Vertical, Strikes Horizontal")
+
+ggplot(MLB_train)+
+  facet_grid(c("strikes","balls"))+
+  geom_histogram(aes(launch_speed,y=..density..),bins=50)+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==0),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==1),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==2),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==0,balls==3),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==1,balls==3),aes(xintercept=mean(launch_speed)))+
+  geom_vline(data=filter(MLB_train,strikes==2,balls==3),aes(xintercept=mean(launch_speed)))+
+  ggtitle("Launch Speeds in MLB 2019 (training data), Balls Horizontal, Strikes Vertical")
+```
+
+We now consider models with balls and strikes with interaction and one with all our variables linearly.
+
+```{r bigger models,echo=FALSE}
+mod_launch_speed_balls_strikes=lm(launch_speed~balls*strikes,data=MLB_train)
+mod_launch_speed_all<- lm(launch_speed~balls+outs+strikes+bases+inning, data=MLB_train)
+```
+
+We find that the AICs of the balls and strikes, or the count, model is `r format(AIC(mod_launch_speed_balls_strikes),scientific=FALSE)`, and the AIC of the model with all variables is `r format(AIC(mod_launch_speed_all),scientific=FALSE)`. Although the AIC of the model with all the variables is the lowest, the AIC is not decreasing particularly quickly and we suspect overfitting. Thus, we begin to investigate a stepwise model.
+
+### Stepwise Model
+
+#### Variables and Interactions
+
+For our stepwise model, we decided to do interactions between balls and strikes to account for pitcher and batter approaches within a plate appearance and interactions between outs and bases to account for approaches based on the conditions the plate appearance occurs under. We also decided to remove innings from consideration since each inning resets itself. Furthermore,while our model showed that the mean launch speed of each inning is statistically different from the first inning, the differences between other innings is not statistically significant. Below is a matrix of p-values from t-tests between the mean launch speed of the innings based on the column and row. Note that we only looked at the 9 innings of a standard game. 
+
+```{r t testing innings,echo=FALSE}
+ttest=matrix(0,9,9)
+for(i in 1:9){
+  for(j in 1:9){
+    ttest[i,j]=t.test((MLB_train%>%filter(inning==as.character(i)))$launch_speed,
+                        (MLB_train%>%filter(inning==as.character(j)))$launch_speed)$p.value
+  }
+}
+round(ttest,3)
+```
+
+Observe that most differences between mean launch speed between innings are not statistically significant except for those with the first inning. We will make a comment on this later.
+
+#### The Model
+
+We now run a stepwise model using both the AIC and BIC criterion.
+
+```{r AIC BIC step models,include=FALSE}
+mod_launch_speed_step_AIC <- step(mod_launch_speed_none, scope=launch_speed~balls*strikes+outs*bases, data=MLB_train)
+
+mod_launch_speed_step_BIC <- step(lm(mod_launch_speed_none, data=MLB_train), scope=launch_speed~balls*strikes+outs*bases, k=log(nrow(MLB_train)),data=MLB_train)
+```
+
+We find that the AIC of the AIC step model is `r format(AIC(mod_launch_speed_step_AIC),scientific=FALSE)` and the AIC of the BIC step model is `r format(AIC(mod_launch_speed_step_BIC),scientific=FALSE)`.
+
+The AIC step model included each of the 34 possible terms. However, several were statistically insignificant compared to our baseline, which is considered to be a bases empty, no outs, 0-0 count scenario.
+
+The BIC step model removed the interactions between balls and strikes from the AIC model only. Still, there were statistically insignificant terms in the model. Particularly of note is that a runner solely on third with no outs or two outs results in a statistically insignificant change from the baseline. Furthermore, it appears that a bases loaded scenario also does not result in statistically significant changes in the launch speed. From a baseball perspective, these results make sense as these are scenarios in which pitchers would focus less on the runners on base.
+
+### Random Forest Model
+
+We now also run a Random Forest Model with our variables.
+
+```{r rf model,include=FALSE}
+mod_launch_speed_rf <- randomForest(launch_speed~balls+strikes+outs+bases, data=MLB_train, importance=TRUE, do.trace=10)      
+```
+
+The Random Forest Model identified balls, then strikes as the most important factors, followed by outs and bases. Our variables are listed below with their increase in MSE:
+
+```{r rf importance,echo=FALSE}
+importance(mod_launch_speed_rf)
+```
+
+### Validation on Training Data/Residual Plots
+
+Below is a table of the AICs of all our models:
+```{r AIC table,echo=FALSE}
+matrix(c("baseline","balls","strikes","bases","outs","inning","balls_strikes","all","AIC Step","BIC Step",AIC(mod_launch_speed_none),AIC(mod_launch_speed_balls),AIC(mod_launch_speed_strikes),AIC(mod_launch_speed_bases),AIC(mod_launch_speed_outs),AIC(mod_launch_speed_inning),AIC(mod_launch_speed_balls_strikes),AIC(mod_launch_speed_all),AIC(mod_launch_speed_step_AIC),AIC(mod_launch_speed_step_BIC)),c(10,2))
+```
+We see that the lowest AICs among our initial models occur with the models with balls and strikes and with all our terms so we will investigate the residuals of those models along with our stepwise models and the random forest. Below are the residual plots of those models under the training data:
+
+```{r adding preds and resids to training data, include=FALSE}
+MLB_train <- MLB_train %>% 
+  add_predictions(mod_launch_speed_balls_strikes, var="pred_balls_strikes") %>%
+  add_predictions(mod_launch_speed_all, var="pred_all")%>%
+  add_predictions(mod_launch_speed_step_AIC, var="pred_step_AIC")%>%
+  add_predictions(mod_launch_speed_step_BIC, var="pred_step_BIC")%>%
+  add_predictions(mod_launch_speed_rf, var="pred_rf")
+
+MLB_train <- MLB_train %>% 
+  add_residuals(mod_launch_speed_balls_strikes, var="resid_balls_strikes")%>%
+  add_residuals(mod_launch_speed_all, var="resid_all")%>%
+  add_residuals(mod_launch_speed_step_AIC, var="resid_step_AIC")%>%
+  add_residuals(mod_launch_speed_step_BIC, var="resid_step_BIC")%>%
+  add_residuals(mod_launch_speed_rf, var="resid_rf")
+```
+
+```{r residual plots of training data,echo=FALSE}
+p1 <- ggplot(MLB_train, aes(x=pred_balls_strikes, y=resid_balls_strikes))+xlab("Fitted launch Speed")+ ylab("Balls and Strikes Model Residuals")+geom_point()
+p2 <- ggplot(MLB_train, aes(x=pred_all, y=resid_all))+xlab("Fitted launch Speed")+ ylab("Total Model Residuals")+geom_point()
+p3 <- ggplot(MLB_train, aes(x=pred_step_AIC, y=resid_step_AIC))+xlab("Fitted launch Speed")+ylab("AIC Step Model Residuals")+geom_point()
+p4 <- ggplot(MLB_train, aes(x=pred_step_BIC, y=resid_step_BIC))+xlab("Fitted launch_speed")+ylab("BIC Step Model Residuals")+geom_point()
+p5 <- ggplot(MLB_train, aes(x=pred_rf, y=resid_rf))+xlab("Fitted launch Speed")+ylab("Random Forest Residuals")+geom_point()
+```
+
+```{r grid the resid plots,echo=FALSE}
+Plot_grid <- plot_grid((plot_grid(p1,p2,p3,ncol=3, nrow=1)),(plot_grid(p4,p5, ncol=2,nrow=1)), ncol=1,nrow=2)
+title <- ggdraw() + 
+  draw_label("Residual VS Fitted plots of the four models",
+             fontface = 'bold')
+plot_grid(title, Plot_grid, ncol = 1, rel_heights = c(0.2,1.2))
+```
+
+We note that some residual plots have vertical lines; this is due to the limited possibile conditions a batter and pitcher face - especially in the balls and strikes model which has only 12 possibilities. Overall, all the residual plots have mean 0, although there seems to be a negative skew, which is due to the skewness of the original data. Without any clear patterns in our residual plots, we now compute the sum of square residuals to determine our best models:
+
+```{r SSR of training data,echo=FALSE}
+MLB_train %>% summarise(SSR_bases_strikes=sum((resid_balls_strikes)^2),
+                        SSR_all=sum((resid_all)^2),
+                        SSR_step_AIC=sum((resid_step_AIC)^2),
+                        SSR_step_BIC=sum((resid_step_BIC)^2),
+                        SSR_rf=sum((resid_rf)^2))
+```
+By the sum of square residuals, our best model is the Stepwise AIC model. We will drop the ball and strikes model from consideration as we now look at the test data.
+
+### Validation on Test Data
+
+We proceed as before with the test data by first plotting the residuals:
+
+```{r add preds and resid to test,include=FALSE}
+MLB_test <- MLB_test %>%
+  add_predictions(mod_launch_speed_balls_strikes,var="pred_balls_strikes")%>%
+  add_predictions(mod_launch_speed_all, var="pred_all") %>%
+  add_predictions(mod_launch_speed_step_AIC, var="pred_step_AIC")%>%
+  add_predictions(mod_launch_speed_step_BIC, var="pred_step_BIC")%>%
+  add_predictions(mod_launch_speed_rf, var="pred_rf")
+
+MLB_test <- MLB_test %>% 
+  add_residuals(mod_launch_speed_balls_strikes,var="resid_balls_strikes")%>%
+  add_residuals(mod_launch_speed_all, var="resid_all") %>%
+  add_residuals(mod_launch_speed_step_AIC, var="resid_step_AIC")%>%
+  add_residuals(mod_launch_speed_step_BIC, var="resid_step_BIC")%>%
+  add_residuals(mod_launch_speed_rf, var="resid_rf")
+```
+
+```{r resid plots of test,echo=FALSE}
+p6 <- ggplot(MLB_test, aes(x=pred_all, y=resid_all))+xlab("Fitted launch Speed")+ ylab("Resid of Total Model")+geom_point()
+p7 <- ggplot(MLB_test, aes(x=pred_step_AIC, y=resid_step_AIC))+xlab("Fitted launch Speed")+ylab("Resid of AIC Step Model")+geom_point()
+p8 <- ggplot(MLB_test, aes(x=pred_step_BIC, y=resid_step_BIC))+xlab("Fitted launch_speed")+ylab("Resid of BIC Step Model")+geom_point()
+p9 <- ggplot(MLB_test, aes(x=pred_rf, y=resid_rf))+xlab("Fitted launch Speed")+ylab("Resid of Random Forrest")+geom_point()
+
+Plot_grid <- plot_grid(p6,p7,p8,p9, ncol=2, nrow=2)
+title <- ggdraw() + 
+  draw_label("Residuals VS Fitted values",
+             fontface = 'bold')
+plot_grid(title, Plot_grid, ncol = 1, rel_heights = c(0.2,1.2))
+```
+
+As before, the residual plots seem to have a negative skew, but the means of the residuals are near zero. Without any clear patterns in our residual plots, we now find the sum of squared residuals of each model to find the best performing model in the test data:
+
+```{r SSR test, echo=FALSE}
+MLB_test %>% summarise(SSR_all=sum((resid_all)^2),
+                       SSR_step_AIC=sum((resid_step_AIC)^2),
+                       SSR_step_BIC=sum((resid_step_BIC)^2),
+                       SSR_rf=sum((resid_rf)^2))
+```
+
+Once again, the stepwise AIC has the lowest sum of squared residuals. Thus, we believe it to be the best model, summarized below:
+
+```{r reproduce AIC step,echo=FALSE}
+summary(mod_launch_speed_step_AIC)
+```
+
+### Conclusion and Further comments
+
+#### Overfitting and Trends in Prediction
+
+Given the limited increase in AIC and the number of terms in our model that are statistically significant, we have concern that we have overfit the model despite the stepwise AIC model having the lowest sum of squared residuals even among our test data. However, the stepwise AIC model seems to agree with the simpler ball and strikes model.
+
+We find the five conditions that lead to the highest and lowest predicted launch speed below:
+
+```{r ranking predictions,echo=FALSE}
+ MLB_test%>%arrange(pred_step_AIC)%>%select(count,bases,outs,pred_step_AIC)%>%unique()%>%slice(1:5,276:280)
+```
+
+These rankings of these results are consistent with the predictions from the balls and strikes model, which predict 0-2 and 1-2 counts to have the lowest launch speed and 3-1 and 3-0 counts to have the highest launch speed.
+
+
+The base configuration was a factor that gave interesting results. It appears that certain configurations of baserunners and outs have differing effects on predicted launch speed rather than the just the act of being on base. We considered simplifying this factor into whether there was a runner on base or whether bases were loaded, etc., but decided against that although that may be worth further research.
+
+#### Other Factors, Further Research, and the First Inning
+
+We believe this analysis was made more difficult by the number of different pitchers and hitters in our dataset who have different approaches. One other factor we considered was the release speed of a pitch. We did not consider it in our analysis as it is partially accounted for by the plate appearance condition, but it is worthwhile to note that pitchers throw at different speeds and that the speed of the ball provides momentum for when the ball hits off the bat. A more focused analysis can be done with only pitchers on relevant teams for game purposes. This would have produced a biased result in our analysis, but may be useful for the particular plate appearance in the game.
+
+Furthermore, we did not consider data on launch speeds of balls not in play. While foul balls out of play would not be relevant for a fielder, this can indicate batter approach and potential launch speeds of balls in play.
+
+Lastly, we comment on the first inning having a statistically significant difference in launch speed compared to other innings. We believe this occurs because of the set line-up that begins each game. Pitchers tend to face the best hitters in the first inning and the part of the lineup they face afterwards tends to be more random as the game goes on. We also noticed that the eight and ninth innings have statistically significant differences in mean compared to the first, second, and third innings. If such a difference does exist (i.e. not a Type I error), then this is likely due to the bullpen becoming a larger part of the game, although we are unsure why no such difference was found between the late and middle innings.
